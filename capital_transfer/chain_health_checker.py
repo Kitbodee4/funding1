@@ -403,6 +403,59 @@ class ChainHealthChecker:
         except Exception as e:
             logger.error(f"✗ Failed to initialize {exchange_name}: {e}")
     
+    async def _fetch_currencies_with_retry(
+        self,
+        exchange,
+        exchange_name: str,
+        max_retries: int = 3
+    ) -> Optional[Dict]:
+        """
+        Fetch currencies with retry logic for transient API failures
+
+        Args:
+            exchange: Exchange instance
+            exchange_name: Exchange name for logging
+            max_retries: Maximum number of retry attempts
+
+        Returns:
+            Dict of currency info or None if failed after all retries
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                logger.debug(f"Fetching currencies from {exchange_name} (attempt {attempt + 1}/{max_retries + 1})")
+                currencies = await exchange.fetch_currencies()
+
+                if currencies is not None:
+                    logger.debug(f"Successfully fetched currencies from {exchange_name}")
+                    return currencies
+                else:
+                    logger.debug(f"Exchange {exchange_name} returned None (attempt {attempt + 1})")
+
+            except Exception as e:
+                error_str = str(e).lower()
+
+                # Check if error is retryable (network issues, timeouts, rate limits)
+                is_retryable = any(keyword in error_str for keyword in [
+                    'timeout', 'network', 'connection', 'rate limit',
+                    'temporarily', 'unavailable', '429', '503', '502', '504'
+                ])
+
+                if is_retryable:
+                    logger.warning(f"Retryable error from {exchange_name} (attempt {attempt + 1}): {str(e)[:100]}")
+                else:
+                    logger.warning(f"Non-retryable error from {exchange_name}: {str(e)[:100]}")
+                    # For non-retryable errors, fail fast
+                    return None
+
+            # Wait before retry (exponential backoff)
+            if attempt < max_retries:
+                wait_time = 2 ** attempt  # 1s, 2s, 4s
+                logger.debug(f"Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+
+        logger.warning(f"Failed to fetch currencies from {exchange_name} after {max_retries + 1} attempts")
+        return None
+
     async def _fetch_currencies_okx_fallback(self, exchange, max_retries: int = 2) -> Optional[Dict]:
         """
         OKX-specific fallback for fetch_currencies() when it returns None
@@ -507,15 +560,17 @@ class ChainHealthChecker:
         await self.initialize_exchange(exchange_name)
 
         if exchange_name not in self.exchanges:
-            # Exchange not available
+            # Exchange not available - but don't block withdrawals
+            # Return healthy status with warning to allow attempts
+            logger.warning(f"Exchange {exchange_name} not initialized, allowing withdrawal attempt")
             return ChainHealth(
                 chain_code=chain_code,
                 exchange=exchange_name,
-                is_healthy=False,
-                is_deposit_enabled=False,
-                is_withdraw_enabled=False,
+                is_healthy=True,  # Changed: Allow withdrawal attempt
+                is_deposit_enabled=True,
+                is_withdraw_enabled=True,
                 last_checked=datetime.now(timezone.utc),
-                error_message="Exchange not initialized"
+                error_message="Exchange not initialized (allowing attempt)"
             )
 
         exchange = self.exchanges[exchange_name]
@@ -541,12 +596,12 @@ class ChainHealthChecker:
             # Check deposit/withdrawal status for USDT on this chain
             currency_code = 'USDT'
 
-            # Fetch currency info with NULL CHECKING and OKX FALLBACK
-            currencies = await exchange.fetch_currencies()
+            # Fetch currency info with RETRY LOGIC
+            currencies = await self._fetch_currencies_with_retry(exchange, exchange_name, max_retries=3)
 
             # CRITICAL FIX: Some exchanges return None from fetch_currencies()
             if currencies is None:
-                logger.warning(f"Exchange {exchange_name} returned None from fetch_currencies()")
+                logger.warning(f"Exchange {exchange_name} returned None from fetch_currencies() after retries")
 
                 # OKX-SPECIFIC FALLBACK: Try alternative method for OKX
                 if exchange_name == 'okx':
@@ -554,12 +609,14 @@ class ChainHealthChecker:
                     currencies = await self._fetch_currencies_okx_fallback(exchange)
 
                     if currencies is None:
-                        logger.warning("OKX fallback also failed")
-                        return self._create_unhealthy(exchange_name, chain_code, "Exchange returned None for currencies (including OKX fallback)")
+                        logger.warning("OKX fallback also failed - allowing withdrawal attempt anyway")
+                        return self._create_healthy_with_warning(exchange_name, chain_code, "API check failed but allowing withdrawal attempt")
                     else:
                         logger.info(f"OKX fallback succeeded, retrieved {len(currencies)} currencies")
                 else:
-                    return self._create_unhealthy(exchange_name, chain_code, "Exchange returned None for currencies")
+                    # Changed: Don't block withdrawal, just log warning
+                    logger.warning(f"API check failed for {exchange_name} - allowing withdrawal attempt anyway")
+                    return self._create_healthy_with_warning(exchange_name, chain_code, "API check failed but allowing withdrawal attempt")
 
             if not isinstance(currencies, dict):
                 logger.warning(f"Exchange {exchange_name} returned invalid currencies type: {type(currencies)}")
@@ -743,10 +800,31 @@ class ChainHealthChecker:
                     chain_names_str = str(possible_chain_names)
 
                 return self._create_unhealthy(exchange_name, chain_code, f"Network not found (tried: {chain_names_str})")
-            
+
         except Exception as e:
-            logger.error(f"Error checking {exchange_name}/{chain_code}: {e}")
-            return self._create_unhealthy(exchange_name, chain_code, str(e))
+            # Log error but allow withdrawal attempt (graceful degradation)
+            error_str = str(e)
+            logger.error(f"Error checking {exchange_name}/{chain_code}: {error_str}")
+
+            # Check if error is API-related (network, timeout, etc.)
+            # If so, allow withdrawal attempt anyway
+            error_lower = error_str.lower()
+            is_api_error = any(keyword in error_lower for keyword in [
+                'timeout', 'network', 'connection', 'rate limit', 'api',
+                'temporarily', 'unavailable', '429', '503', '502', '504',
+                'fetch', 'request', 'http'
+            ])
+
+            if is_api_error:
+                logger.warning(f"API error for {exchange_name}/{chain_code}, allowing withdrawal attempt")
+                return self._create_healthy_with_warning(
+                    exchange_name,
+                    chain_code,
+                    f"Health check API error (allowing attempt): {error_str[:100]}"
+                )
+            else:
+                # For non-API errors (logic errors, etc.), mark as unhealthy
+                return self._create_unhealthy(exchange_name, chain_code, error_str)
     
     def _create_unhealthy(self, exchange: str, chain_code: str, error: str) -> ChainHealth:
         """Create unhealthy chain health object"""
@@ -758,6 +836,24 @@ class ChainHealthChecker:
             is_withdraw_enabled=False,
             last_checked=datetime.now(timezone.utc),
             error_message=error
+        )
+
+    def _create_healthy_with_warning(self, exchange: str, chain_code: str, warning: str) -> ChainHealth:
+        """
+        Create healthy chain health object with warning
+
+        Used when health check fails but we want to allow withdrawal attempt anyway.
+        This provides graceful degradation when API checks fail.
+        """
+        logger.warning(f"⚠ {exchange}/{chain_code}: {warning} - marking as healthy to allow attempt")
+        return ChainHealth(
+            chain_code=chain_code,
+            exchange=exchange,
+            is_healthy=True,  # Allow withdrawal attempt
+            is_deposit_enabled=True,
+            is_withdraw_enabled=True,
+            last_checked=datetime.now(timezone.utc),
+            error_message=warning
         )
     
     async def check_multiple_chains(

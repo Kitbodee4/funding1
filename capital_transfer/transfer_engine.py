@@ -622,7 +622,15 @@ class CapitalTransferEngine:
             if not valid_networks:
                 error_msg = f"No valid networks found for {exchange_name}/{chain_code} withdrawal"
                 if invalid_networks:
-                    error_msg += f" (checked networks: {invalid_networks})"
+                    error_msg += f". Checked networks: {invalid_networks}"
+                # Add health check info for debugging
+                try:
+                    health = await self.health_checker.check_chain_health(exchange_name, chain_code)
+                    error_msg += f". Health check: withdraw_enabled={health.is_withdraw_enabled}"
+                    if health.error_message:
+                        error_msg += f", error='{health.error_message[:100]}'"
+                except Exception:
+                    pass
                 logger.error(f"✗ {error_msg}")
                 return False, None, error_msg
 
@@ -730,11 +738,12 @@ class CapitalTransferEngine:
 
                 except Exception as e:
                     last_error = str(e)
-                    logger.debug(f"Withdrawal attempt with validated network '{network}' failed: {last_error}")
+                    # Log at INFO level so errors are visible to users
+                    logger.info(f"Withdrawal attempt with validated network '{network}' failed: {last_error[:200]}")
 
                     # Special handling for rate limit errors (like Bybit's retCode 131001)
                     if "131001" in last_error or "rate limit" in last_error.lower():
-                        logger.warning(f"Rate limit error from {exchange_name}: {last_error[:100]}...")
+                        logger.warning(f"Rate limit error from {exchange_name}: {last_error[:150]}")
                         # Add extra delay before retry with different network
                         await asyncio.sleep(5)
                         continue
@@ -743,14 +752,16 @@ class CapitalTransferEngine:
                     continue
 
             # All validated network names failed
-            error_msg = f"Withdrawal failed with all validated networks {valid_networks}: {last_error}"
+            # Include detailed error message for debugging
+            error_msg = f"Withdrawal failed with all validated networks {valid_networks}. Last error: {last_error[:300]}"
             logger.error(f"✗ {error_msg}")
             return False, None, error_msg
 
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"✗ Withdrawal failed: {error_msg}")
-            return False, None, error_msg
+            # Log full error for debugging
+            logger.error(f"✗ Withdrawal failed with exception: {error_msg[:300]}")
+            return False, None, f"{exchange_name} withdrawal error: {error_msg[:300]}"
 
     async def check_deposit_arrival(
         self,
